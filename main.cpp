@@ -1,14 +1,14 @@
-#include <iostream>
+#include <cmath>
+#include <cstddef>
 #include <fstream>
-#include <vector>
-#include <unordered_map>
+#include <iostream>
 #include <list>
-#include <string>
+#include <map>
 #include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-// TODO: попытаться ускорить это + проверить, что модель кешей +- правдивая
-
-// Структура для представления строки лога
 struct LogEntry {
     std::string access_type;
     uint64_t address;
@@ -16,7 +16,7 @@ struct LogEntry {
     uint64_t return_address;
 };
 
-// Структура для кэш-линии
+
 struct CacheLine {
     uint64_t tag;
     bool valid;
@@ -25,7 +25,7 @@ struct CacheLine {
     CacheLine() : tag(0), valid(false), last_access_time(0) {}
 };
 
-// Класс для представления одного уровня кэша
+
 class Cache {
 private:
     size_t size;           // размер кэша в байтах
@@ -42,6 +42,11 @@ private:
     size_t misses;
 
 public:
+    Cache() : size(0), line_size(0), associativity(0), 
+            is_shared(false), num_sets(0), access_counter(0), 
+            hits(0), misses(0) {
+    }
+
     Cache(size_t size_bytes, size_t line_size_bytes, size_t associativity, bool shared) 
         : size(size_bytes), line_size(line_size_bytes), associativity(associativity), 
           is_shared(shared), access_counter(0), hits(0), misses(0) {
@@ -50,24 +55,32 @@ public:
         sets.resize(num_sets, std::vector<CacheLine>(associativity));
     }
 
-    bool access(uint64_t address, uint64_t thread_id) {
-        uint64_t set_index = (address / line_size) % num_sets;
-        uint64_t tag = address / (line_size * num_sets);
+
+    bool access(uint64_t address, bool count_cache = true) {
+        const uint64_t offset_bits = log2(line_size);
+        const uint64_t index_bits = log2(num_sets);
         
-        // Поиск в наборе
+        const uint64_t set_mask = (1ULL << index_bits) - 1;
+        
+        uint64_t set_index = (address >> offset_bits) & set_mask;
+        uint64_t tag = address >> (offset_bits + index_bits);
+        
         auto& set = sets[set_index];
         for (auto& line : set) {
             if (line.valid && line.tag == tag) {
                 line.last_access_time = ++access_counter;
-                hits++;
+                if (count_cache) {
+                    hits++;
+                }
                 return true;  // cache hit
             }
         }
 
-        // Cache miss - ищем место для новой линии
-        misses++;
+        // Cache miss
+        if (count_cache) {
+            misses++;
+        }
         
-        // Ищем пустую линию или линию для замены
         CacheLine* replacement_line = nullptr;
         for (auto& line : set) {
             if (!line.valid) {
@@ -76,7 +89,7 @@ public:
             }
         }
 
-        // Если нет пустых линий, используем LRU
+        // LRU
         if (!replacement_line) {
             uint64_t oldest_time = UINT64_MAX;
             for (auto& line : set) {
@@ -87,7 +100,6 @@ public:
             }
         }
 
-        // Обновляем линию
         replacement_line->valid = true;
         replacement_line->tag = tag;
         replacement_line->last_access_time = ++access_counter;
@@ -101,12 +113,16 @@ public:
     }
 };
 
-// Класс для управления иерархией кэшей
+
 class CacheHierarchy {
 private:
-    std::vector<Cache> l1_caches;  // по одному на поток
+    std::map<uint64_t, Cache> l1_caches;  // по одному на поток
     Cache l2_cache;
     Cache l3_cache;
+
+    size_t l1_size;
+    size_t l1_line_size;
+    size_t l1_associativity;
 
 public:
     CacheHierarchy(
@@ -115,25 +131,25 @@ public:
         size_t l2_size, size_t l2_line_size, size_t l2_associativity,
         size_t l3_size, size_t l3_line_size, size_t l3_associativity
     ) : l2_cache(l2_size, l2_line_size, l2_associativity, true),
-        l3_cache(l3_size, l3_line_size, l3_associativity, true) {
-        
-        // Создаем L1 кэш для каждого ядра
-        for (size_t i = 0; i < num_cores; i++) {
-            l1_caches.emplace_back(l1_size, l1_line_size, l1_associativity, false);
-        }
+        l3_cache(l3_size, l3_line_size, l3_associativity, true),
+        l1_size(l1_size), l1_line_size(l1_line_size), l1_associativity(l1_associativity) {
     }
 
     void access(uint64_t address, uint64_t thread_id) {
-        // TODO: не совсем верный подсчет, надо исправить
         // Пробуем L1 // Берем L1-data кеш, L1-instruction не интересует
-        bool l1_hit = l1_caches[thread_id % l1_caches.size()].access(address, thread_id); // можно сделать предположние, что в принципе каждый поток на отдельном ядре
+        // Предполагаем, что каждый поток на отдельном ядре
+        if (l1_caches.find(thread_id) == l1_caches.end()) {
+            l1_caches[thread_id] = std::move(Cache(l1_size, l1_line_size, l1_associativity, false));
+        }
+
+        bool l1_hit = l1_caches[thread_id].access(address);
         if (l1_hit) return;
 
         // При промахе L1 пробуем L2
-        bool l2_hit = l2_cache.access(address, thread_id);
+        bool l2_hit = l2_cache.access(address);
         if (l2_hit) {
             // При попадании в L2 подгружаем также в L1
-            l1_caches[thread_id % l1_caches.size()].access(address, thread_id);
+            l1_caches[thread_id].access(address, false);
             return;
         }
 
@@ -141,8 +157,8 @@ public:
         bool l3_hit = l3_cache.access(address, thread_id);
         
         // При промахе L3 данные подгружаются из памяти во все уровни кэша
-        l2_cache.access(address, thread_id);
-        l1_caches[thread_id % l1_caches.size()].access(address, thread_id);
+        l2_cache.access(address, false);
+        l1_caches[thread_id].access(address, false);
     }
 
     void print_statistics() {
@@ -152,7 +168,7 @@ public:
 
         for (const auto& l1 : l1_caches) {
             size_t hits, misses;
-            l1.get_statistics(hits, misses);
+            l1.second.get_statistics(hits, misses);
             l1_hits += hits;
             l1_misses += misses;
         }
@@ -167,7 +183,7 @@ public:
     }
 };
 
-// Функция для парсинга строки лога
+
 LogEntry parse_log_line(const std::string& line) {
     LogEntry entry;
     std::stringstream ss(line);
@@ -176,22 +192,20 @@ LogEntry parse_log_line(const std::string& line) {
 }
 
 int main() {
-    // TODO: сделать L1 кеш полностью ассоциативным
-    // Создаем иерархию кэшей с типичными параметрами
     CacheHierarchy cache_hierarchy(
-        8,                          // количество ядер
-        32 * 1024,                 // L1 size (32KB)
+        78,                          // количество ядер
+        5 * 1024 * 1024,                 // L1 size (5 MiB)
         64,                        // L1 line size
         8,                         // L1 associativity
-        256 * 1024,               // L2 size (256KB)
+        39 * 1024 * 1024,               // L2 size (39 MiB)
         64,                        // L2 line size
         8,                         // L2 associativity
-        8 * 1024 * 1024,          // L3 size (8MB)
+        6 * 1024 * 1024,          // L3 size (64 MiB)
         64,                        // L3 line size
         16                         // L3 associativity
     );
 
-    std::ifstream input_file("example3.log"); // в файле 61 543 901 строк
+    std::ifstream input_file("memory_trace.log");
     std::string line;
 
     uint64_t i = 0; 
