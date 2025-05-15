@@ -192,6 +192,7 @@ LogEntry parse_log_line(const std::string& line) {
 }
 
 int main() {
+    // Можно промедилировать полностью ассоциативный кеш, подобрав нужную ассоциативность
     CacheHierarchy cache_hierarchy(
         78,                          // количество ядер
         5 * 1024 * 1024,                 // L1 size (5 MiB)
